@@ -23,6 +23,8 @@
 
 #include "JSUtils.h"
 #include "JSConvertTypedArray.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #include <stdlib.h>
 
@@ -885,53 +887,169 @@ private:
 
   _WRAP_METHOD_IS_OBJECT(Texture)
 
+  inline void decodeURI(char *dst, const char *src) {
+    char a, b;
+    while (*src) {
+      if ((*src == '%') &&
+          ((a = src[1]) && (b = src[2])) &&
+          (isxdigit(a) && isxdigit(b))) {
+        if (a >= 'a') {
+          a -= 'a' - 'A';
+        }
+        if (a >= 'A') {
+          a -= ('A' - 10);
+        } else {
+          a -= '0';
+        }
+        if (b >= 'a') {
+          b -= 'a' - 'A';
+        }
+        if (b >= 'A') {
+          b -= ('A' - 10);
+        } else {
+          b -= '0';
+        }
+        *dst++ = 16 * a + b;
+        src += 3;
+      } else if (*src == '+') {
+        *dst++ = ' ';
+        src++;
+      } else {
+        *dst++ = *src++;
+      }
+    }
+    *dst++ = '\0';
+  }
+
+  // Load image data from an object with a `.localUri` member
+  std::shared_ptr<void> loadImage(JSContextRef jsCtx, JSObjectRef jsPixels,
+                                  int *fileWidth, int *fileHeight, int *fileComp) {
+    JSValueRef jsLocalUri = JSObjectGetPropertyNamed(jsCtx, jsPixels, "localUri");
+    if (jsLocalUri && JSValueIsString(jsCtx, jsLocalUri)) {
+      // TODO(nikki): Check that this file is in the right scope
+      auto localUri = jsValueToSharedStr(jsCtx, jsLocalUri);
+      if (strncmp(localUri.get(), "file://", 7) != 0) {
+        return std::shared_ptr<void>(nullptr);
+      }
+      char localPath[strlen(localUri.get())];
+      decodeURI(localPath, localUri.get() + 7);
+      return std::shared_ptr<void>(stbi_load(localPath,
+                                             fileWidth, fileHeight, fileComp,
+                                             STBI_rgb_alpha),
+                                   stbi_image_free);
+    }
+    return std::shared_ptr<void>(nullptr);
+  }
+
+
   _WRAP_METHOD(texImage2D, 6) {
+    GLenum target;
+    GLint level, internalformat;
+    GLsizei width = 0, height = 0, border = 0;
+    GLenum format, type;
+    JSObjectRef jsPixels;
+
     if (jsArgc == 9) {
       // 9-argument version
-      JS_UNPACK_ARGV(GLenum target, GLint level, GLint internalformat,
-                       GLsizei width, GLsizei height, GLsizei border,
-                       GLenum format, GLenum type);
-      // Null?
-      if (JSValueIsNull(jsCtx, jsArgv[8])) {
-        addToNextBatch([=] {
-          glTexImage2D(target, level, internalformat,
-                       width, height, border,
-                       format, type, nullptr);
-        });
-        return nullptr;
-      }
-
-      JSObjectRef jsPixels = (JSObjectRef) jsArgv[8];
-
-      // Raw texture data TypedArray?
-      {
-        auto data = jsValueToSharedArray(jsCtx, jsPixels, nullptr);
-        if (data) {
-          if (unpackFLipY) {
-            flipPixels((GLubyte *) data.get(), width * bytesPerPixel(type, format), height);
-          }
-          addToNextBatch([=] {
-            glTexImage2D(target, level, internalformat,
-                         width, height, border,
-                         format, type, data.get());
-          });
-          return nullptr;
-        }
-      }
-
-      // None of the above?
-      throw std::runtime_error("RNWebGL: Invalid pixel data argument for"
-                               " gl.texImage2D()!");
-    } else if (jsArgc == 6) {
-      // 6-argument version (no width, height, border)
-      throw std::runtime_error("RNWebGL: gl.texImage2D() does't support 6-argument"
-                               " version yet!");
+      JS_UNPACK_ARGV(target, level, internalformat, width, height, border, format, type);
+      jsPixels = (JSObjectRef) jsArgv[8];
+    } else if  (jsArgc == 6) {
+      // 6-argument version
+      JS_UNPACK_ARGV(target, level, internalformat, format, type);
+      jsPixels = (JSObjectRef) jsArgv[5];
     } else {
       throw std::runtime_error("RNWebGL: Invalid number of arguments to gl.texImage2D()!");
     }
+
+    // Null?
+    if (JSValueIsNull(jsCtx, jsPixels)) {
+      addToNextBatch([=] {
+        glTexImage2D(target, level, internalformat, width, height, border, format, type, nullptr);
+      });
+      return nullptr;
+    }
+
+    std::shared_ptr<void> data(nullptr);
+
+    // Try TypedArray
+    if (jsArgc == 9) {
+      data = jsValueToSharedArray(jsCtx, jsPixels, nullptr);
+    }
+
+    // Try object with `.localUri` member
+    if (!data) {
+      data = loadImage(jsCtx, jsPixels, &width, &height, nullptr);
+    }
+
+    if (data) {
+      if (unpackFLipY) {
+        flipPixels((GLubyte *) data.get(), width * bytesPerPixel(type, format), height);
+      }
+      addToNextBatch([=] {
+        glTexImage2D(target, level, internalformat, width, height, border, format, type, data.get());
+      });
+      return nullptr;
+    }
+
+    // Nothing worked...
+    throw std::runtime_error("RNWebGL: Invalid pixel data argument for gl.texImage2D()!");
   }
 
-  _WRAP_METHOD_UNIMPL(texSubImage2D)
+  //_WRAP_METHOD_UNIMPL(texSubImage2D)
+  _WRAP_METHOD(texSubImage2D, 7) {
+    GLenum target;
+    GLint level, xoffset, yoffset;
+    GLsizei width = 0, height = 0;
+    GLenum format, type;
+    JSObjectRef jsPixels;
+
+    if (jsArgc == 9) {
+      // 9-argument version
+      JS_UNPACK_ARGV(target, level, xoffset, yoffset, width, height, format, type);
+      jsPixels = (JSObjectRef) jsArgv[8];
+    } else if  (jsArgc == 7) {
+      // 7-argument version
+      JS_UNPACK_ARGV(target, level, xoffset, yoffset, format, type);
+      jsPixels = (JSObjectRef) jsArgv[6];
+    } else {
+      throw std::runtime_error("RNWebGL: Invalid number of arguments to gl.texSubImage2D()!");
+    }
+
+    // Null?
+    if (JSValueIsNull(jsCtx, jsPixels)) {
+      addToNextBatch([=] {
+        void *nulled = calloc(width * height, bytesPerPixel(type, format));
+        glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, nulled);
+        free(nulled);
+      });
+      return nullptr;
+    }
+
+    std::shared_ptr<void> data(nullptr);
+
+    // Try TypedArray
+    if (jsArgc == 9) {
+      data = jsValueToSharedArray(jsCtx, jsPixels, nullptr);
+    }
+
+    // Try object with `.localUri` member
+    if (!data) {
+      data = loadImage(jsCtx, jsPixels, &width, &height, nullptr);
+    }
+
+    if (data) {
+      if (unpackFLipY) {
+        flipPixels((GLubyte *) data.get(), width * bytesPerPixel(type, format), height);
+      }
+      addToNextBatch([=] {
+        glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, data.get());
+      });
+      return nullptr;
+    }
+
+    // Nothing worked...
+    throw std::runtime_error("RNWebGL: Invalid pixel data argument for gl.texSubImage2D()!");
+  }
 
   _WRAP_METHOD_SIMPLE(texParameterf, glTexParameterf, target, pname, param)
 
